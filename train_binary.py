@@ -41,10 +41,6 @@ class binaryClassifier:
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(self.device)
 
     def prepare_train(self, ds, test_size=0.2, seed=42):
-        """
-        단일 Dataset을 받아 train/test로 나누고 토크나이징까지 수행.
-        """
-
         ds_split = ds.train_test_split(test_size=test_size, seed=seed)
         train_ds = ds_split["train"]
         test_ds = ds_split["test"]
@@ -108,7 +104,6 @@ class binaryClassifier:
         metrics = trainer.evaluate()
         print("\n📊 Evaluation Metrics:", metrics)
 
-        # ✅ 모델 저장
         save_path = "./bert-bin-classifier/best"
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
@@ -173,21 +168,16 @@ def visualize_embeddings(emb, labels, title, type):
     plt.show()
 
 
-# ============================================================
-# 4️⃣ 실행 예시
-# ============================================================
 
 if __name__ == "__main__":
-    # ✅ CSV 로드
+
     df = pd.read_csv(r"datasets/JIGSAW/train.csv")
     ds = preprocess(df)
 
-    # ✅ 학습 및 저장
     model_name = "bert-base-uncased"
     bc = binaryClassifier(model_name)
     model_path = bc.train(ds)
 
-    # ✅ 임베딩 추출
     n_sample = 500
     sample = ds.shuffle(seed=42).select(range(n_sample))
     texts = list(sample["text"])
@@ -209,3 +199,4 @@ if __name__ == "__main__":
     # CLS embedding
     emb_cls = encode_embeddings(model_path, texts, method="cls")
     visualize_embeddings(emb_cls, labels, "t-SNE of [CLS] Token Embeddings", "conti")
+
