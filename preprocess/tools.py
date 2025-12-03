@@ -52,19 +52,24 @@ def print_eval(true_label, pred_label):
 
 
 
+
 def toxic_preprocess(df, group):
     """
-    Preprocess dataframe with given group name
+    Preprocess dataframe with given group name, converted to Hugging Face Dataset.
 
     Input:
         df: original pandas dataframe
         group: group name ["gender", "race", "religion"]
     """
-    
-    df = df.copy()
-    df = df.dropna(subset=["comment_text", "target"])
-    df["label"] = np.array(df["target"] >= 0.5, dtype = int)
-    df = df.rename(columns={"comment_text": "text", "target": "toxicity"})
+
+    if group is None: 
+        dataset = Dataset.from_pandas(df)
+
+        dataset = dataset.filter(lambda x: x['comment_text'] is not None and x['target'] is not None)
+        dataset = dataset.map(lambda x: {"label": int(x["target"] >= 0.5)})
+        
+        dataset = dataset.rename_column("comment_text", "text")
+        dataset = dataset.rename_column("target", "toxicity")
 
     group_colnames = {
         "gender": ['female', 'male', 'transgender', 'other_gender'], 
@@ -72,13 +77,27 @@ def toxic_preprocess(df, group):
         "religion" : ["christian", "jewish", "muslim", "hindu", "buddhist", "atheist", "other_religion"]
     }
 
-    if group is not None: 
+    if group is not None:
         selected_colnames = group_colnames[group]
-        df["subgroup_weights"] = df[selected_colnames].values.tolist()
-        df = df.loc[np.sum(df["subgroup_weights"]) > 0] 
-        df = df[["text", "toxicity", "label"] + selected_colnames]
 
-    return Dataset.from_pandas(df)
+        def add_weight_array(elmt): 
+            arr = []
+            for c in selected_colnames:
+                v = elmt[c]
+                if v is None:
+                    v = 0
+                elif isinstance(v, float) and np.isnan(v):
+                    v = 0
+                arr.append(v)
+            elmt["weights"] = np.array(arr, dtype=float)
+            return elmt
+        
+        group_ds = dataset.map(add_weight_array)
+
+        group_ds = group_ds.filter(lambda x: sum(x["weights"]) > 0)
+        dataset = group_ds.select_columns(["text", "toxicity", "label", "weights"] + selected_colnames)
+
+    return dataset
 
 
 
@@ -219,7 +238,6 @@ def eval_baseline(eval_ds, group_name):
         })
     
     return group_ds
-
 
 
 
