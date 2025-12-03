@@ -174,29 +174,41 @@ def get_pred(check_ds, model_ckpt, return_metric = True):
             ex["text"],
             padding="max_length",
             truncation=True,
-            max_length=256
+            max_length=256,
+            return_tensors = "pt"
         )
-        return out
-    
-    tokenized_ds = check_ds.map(tokenize, batched=True)
 
-    bsz = 100
+        return {
+            "input_ids" : out["input_ids"], 
+            "attention_mask" : out["attention_mask"]
+        }
+    
+    tokenized_ds = check_ds.map(
+        tokenize,
+        batched=True,
+        remove_columns=check_ds.column_names  
+    )
+
+    bsz = 50
     probs = []
-    for batch in tokenized_ds.with_format("torch").iter(batch_size=bsz):
-        out = machine(**batch)
-        logits = out.logits
-        batch_probs = torch.softmax(logits, axis = -1).cpu()
-        probs.extend(batch_probs[:, 0].tolist())
+
+    with torch.no_grad(): 
+        for batch in tokenized_ds.iter(batch_size=bsz):
+            batch = {k: torch.tensor(v).to(device) for k, v in batch.items()}
+            out = machine(**batch)
+            logits = out.logits
+            batch_probs = torch.softmax(logits, axis = -1).cpu()
+            probs.extend(batch_probs[:, 0].tolist())
 
     pred_labels = (np.array(probs) < 0.5).astype(int)
     check_ds = check_ds.add_column("scores", 1 - np.array(probs))
     check_ds = check_ds.add_column("preds", pred_labels)
 
-    
     if return_metric:
         print_eval(check_ds["label"], pred_labels)
 
     return check_ds
+
 
 
 
