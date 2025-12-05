@@ -1,5 +1,5 @@
-import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# import os 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import torch
 from torch.utils.data import DataLoader
@@ -15,55 +15,83 @@ from transformers import (
     TrainingArguments
 )
 from transformers import TrainerCallback
-from preprocess.tools import toxic_preprocess
+from fair.tools import *
 import time
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
 
+# from evaluate import load
 from huggingface_hub import login
 from huggingface_hub import create_repo
 
+import argparse
+
+
+
+
+
 
 class FairnessTrainer(Trainer):
+    def __init__(self, *args, warmup_epochs=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.warmup_epochs = warmup_epochs
+        self._warmup_steps = None  
+
+    def _setup_warmup(self):
+        if self._warmup_steps is None:
+            steps_per_epoch = len(self.get_train_dataloader())
+            self._warmup_steps = steps_per_epoch * self.warmup_epochs
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+
+        # warm-up step 계산
+        self._setup_warmup()
+        step = self.state.global_step
 
         outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             labels=inputs["labels"],
-            output_hidden_states= True # True
+            output_hidden_states=True
         )
-        ce_loss = outputs.loss[0]
-        # print(ce_loss, ce_loss.shape) 
-        # print(ce_loss[0])
-        cls_emb = outputs.hidden_states[-1][:, 0, :]
-        # cls_emb = outputs.last_hidden_state[:, 0, :]  
 
-        # toxic direction
+        ce_loss = outputs.loss[0]
+        cls_emb = outputs.hidden_states[-1][:, 0, :]
+
         v = self.v_tox.to(cls_emb.device)
-        v = v / (v.norm() + 1e-8)
-        proj = (cls_emb * v).sum(-1)
 
         # subgroup weights
         w = inputs["weights"]   # [B, K]
-        K = int(w.shape[1])
+        weighted_sum = cls_emb.T @ w
+        valid = w.sum(axis=0) > 0
+        
+        wm_emb = weighted_sum / torch.clamp(w.sum(axis=0), min=1e-6)
+        wm_emb_valid = wm_emb[:, valid]
 
-        fair_total = 0.0
-        fair_subgroup = torch.zeros(K)
-        for k in range(K):
-            w_k = w[:, k]
-            m_k = (w_k * proj).sum() / (w_k.sum() + 1e-8)
-            fair_subgroup[k] = m_k
-            fair_total += torch.abs(m_k)
+        # subgroup loss 계산
+        pair_dist = []
+        K_valid = wm_emb_valid.shape[1]
+        for i in range(K_valid):
+            for j in range(i+1, K_valid):
+                pair_dist.append(torch.norm(wm_emb_valid[:, i] - wm_emb_valid[:, j], p=2))
 
-        fair_mean = torch.mean(fair_subgroup)
-        loss = ce_loss + 0.3 * fair_total / K
-        # loss = ce_loss + 0.3 * torch.mean(torch.pow(fair_subgroup - fair_mean, 2))
+        subgroup_loss = torch.mean(torch.stack(pair_dist)) if pair_dist else torch.tensor(0.0, device=wm_emb.device)
 
-        self.log({"fairness_sum": fair_total.detach().cpu().item()})
-        self.log({"ce_loss": ce_loss.detach().cpu().item()})
-        self.log({"total_loss": loss.detach().cpu().item()})
+        toxic_loss = torch.norm(v)
+
+        beta = 0.006
+        loss = ce_loss + beta * subgroup_loss
+
+        self.log({
+            "loss_total": loss.item(),
+            "loss_ce": ce_loss.item(),
+            "loss_subgroup": float(subgroup_loss),
+            "loss_toxic": float(toxic_loss),
+            "phase": 1 if step < self._warmup_steps else 2,
+        })
 
         return (loss, outputs) if return_outputs else loss
+
 
 
 
@@ -75,10 +103,10 @@ class ToxicDirectionCallback(TrainerCallback):
         model = trainer.model.eval()
         device = trainer.model.device
 
+
         import random
         random_idx = random.sample(range(len(trainer.train_dataset)), 2000)
 
-        # 샘플만 DataLoader로 만들기
         sample_subset = torch.utils.data.Subset(trainer.train_dataset, random_idx)
         sample_loader = DataLoader(
             sample_subset,
@@ -110,7 +138,8 @@ class ToxicDirectionCallback(TrainerCallback):
         mu_non = all_cls[all_labels == 0].mean(0)
         v = mu_tox - mu_non
 
-        trainer.v_tox = v / (v.norm() + 1e-8)
+        # trainer.v_tox = v / (v.norm() + 1e-8)
+        trainer.v_tox = v 
 
         print(f"[Epoch {state.epoch}] v_tox updated. norm={trainer.v_tox.norm():.4f}. peek = {trainer.v_tox[:10]}")
 
@@ -158,6 +187,7 @@ def compute_directions(model, full_loader, device):
     v_tox = (mu_tox - mu_non)
     v_tox = v_tox / (v_tox.norm() + 1e-8)
 
+    # identity subgroup별 mean 계산
     subgroup_ids = torch.unique(all_groups)
     subgroup_means = {}
 
@@ -166,6 +196,7 @@ def compute_directions(model, full_loader, device):
         if len(group_emb) > 0:
             gmu = group_emb.mean(dim=0)
             subgroup_means[int(gid.item())] = gmu / (gmu.norm() + 1e-8)
+
 
     return v_tox.detach(), subgroup_means
 
@@ -235,7 +266,7 @@ class FairToxic:
 
         hf_ds = Dataset.from_list(dataset)
 
-        ds = hf_ds.train_test_split(test_size=0.1, seed=2025)
+        ds = hf_ds.train_test_split(test_size=0.2, seed=2025)
         train_ds = ds["train"]
         valid_ds = ds["test"]
 
@@ -244,7 +275,7 @@ class FairToxic:
             encoded = self.tokenizer(
                 batch["text"],
                 truncation=True,
-                padding=False  # pad는 collator에서 수행
+                padding=False 
             )
             batch["input_ids"] = encoded["input_ids"]
             batch["attention_mask"] = encoded["attention_mask"]
@@ -252,6 +283,7 @@ class FairToxic:
 
         train_ds = train_ds.map(tokenize_fn, batched=True)
         valid_ds = valid_ds.map(tokenize_fn, batched=True)
+
 
         def convert_subgroup(batch):
             batch["weights"] = [torch.tensor(w, dtype=torch.float32) for w in batch["weights"]]
@@ -265,20 +297,10 @@ class FairToxic:
         valid_ds = valid_ds.with_format("torch", columns=columns)
 
 
-        # print("\n====== Dataset Schema Check ======")
-        # print("Train features:", train_ds.features)
-        # print("Valid features:", valid_ds.features)
+        print("\n====== Dataset Schema Check ======")
+        print("Train features:", train_ds.features)
+        print("Valid features:", valid_ds.features)
 
-
-        sample = train_ds[0]
-        # print("Train sample keys:", sample.keys())
-        for key in columns:
-            if key not in sample:
-                print(f"❌ Missing key in sample: {key}")
-            else:
-                print(f"OK key: {key}, shape = {sample[key].shape if hasattr(sample[key], 'shape') else type(sample[key])}")
-
-        print("=================================\n")
 
         return train_ds, valid_ds
     
@@ -286,82 +308,86 @@ class FairToxic:
 
 
 
-    # def evaluate(self, trainer, ds, save_path):
+    def evaluate(self, trainer, ds):
 
-    #     model = trainer.model
-    #     device = model.device
+        model = trainer.model
+        device = model.device
 
-    #     all_logits = []
-    #     all_labels = []
-    #     all_groups = []
-    #     all_cls = []
+        all_logits = []
+        all_labels = []
+        all_groups = []
+        all_cls = []
 
-    #     # ds = DataLoader(ds, batch_size= 16, shuffle=False, collate_fn = self.collate_fn)
+        # ds = DataLoader(ds, batch_size= 16, shuffle=False, collate_fn = self.collate_fn)
 
-    #     for batch in ds:
-    #         batch = {k: v.to(device) for k, v in batch.items()}
+        for batch in ds:
+            for k, v in batch.items():
+                print(k, v.shape)
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-    #         with torch.no_grad():
-    #             outputs = model(
-    #                 input_ids=batch["input_ids"],
-    #                 attention_mask=batch["attention_mask"],
-    #                 output_hidden_states=True
-    #             )
-    #         logits = outputs.logits
-    #         cls_emb = outputs.hidden_states[-1][:, 0, :]
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    output_hidden_states=True
+                )
+            logits = outputs.logits
+            cls_emb = outputs.hidden_states[-1][:, 0, :]
 
-    #         all_logits.append(logits)
-    #         all_labels.append(batch["labels"])
-    #         all_groups.append(batch["weights"])
-    #         all_cls.append(cls_emb)
+            all_logits.append(logits)
+            all_labels.append(batch["labels"])
+            all_groups.append(batch["weights"])
+            all_cls.append(cls_emb)
 
-    #     logits = torch.cat(all_logits)
-    #     labels = torch.cat(all_labels)
-    #     subgroup = torch.cat(all_groups)      # [N, K]
-    #     cls_all = torch.cat(all_cls)          # [N, H]
+        logits = torch.cat(all_logits)
+        labels = torch.cat(all_labels)
+        subgroup = torch.cat(all_groups)      # [N, K]
+        cls_all = torch.cat(all_cls)          # [N, H]
 
-    #     preds = logits.argmax(-1)
+        preds = logits.argmax(-1)
 
-    #     # basic metrics
-    #     acc = accuracy_score(labels.cpu(), preds.cpu())
-    #     p = precision_score(labels.cpu(), preds.cpu())
-    #     r = recall_score(labels.cpu(), preds.cpu())
-    #     f1 = f1_score(labels.cpu(), preds.cpu())
+        # basic metrics
+        acc = accuracy_score(labels.cpu(), preds.cpu())
+        p = precision_score(labels.cpu(), preds.cpu())
+        r = recall_score(labels.cpu(), preds.cpu())
+        f1 = f1_score(labels.cpu(), preds.cpu())
 
-    #     # FPR
-    #     fp = ((preds == 1) & (labels == 0)).sum().item()
-    #     tn = ((preds == 0) & (labels == 0)).sum().item()
-    #     fpr = fp / (fp + tn + 1e-8)
+        # FPR
+        fp = ((preds == 1) & (labels == 0)).sum().item()
+        tn = ((preds == 0) & (labels == 0)).sum().item()
+        fpr = fp / (fp + tn + 1e-8)
 
-    #     # fairness metric: weighted mean projections
-    #     v = trainer.v_tox.to(device)
-    #     v = v / (v.norm() + 1e-8)
+        # fairness metric: weighted mean projections
+        v = trainer.v_tox.to(device)
+        # v = v / (v.norm() + 1e-8)
 
-    #     proj = (cls_all * v).sum(-1)        # [N]
+        # proj = (cls_all * v).sum(-1)        # [N]
+        wm_emb = cls_all.T @ subgroup
+        wm_emb /= subgroup.sum(axis = 0)
 
-    #     K = subgroup.shape[1]
-    #     fairness_scores = {}
+        K = subgroup.shape[1]
+        fairness_scores = {}
 
-    #     for k in range(K):
-    #         w_k = subgroup[:, k]
-    #         numer = (w_k * proj).sum()
-    #         denom = w_k.sum() + 1e-8
-    #         fairness_scores[f"subgroup_{k}_bias"] = (numer / denom).item()
+        # for k in range(K):
+        #     w_k = subgroup[:, k]
+        #     numer = (w_k * proj).sum()
+        #     denom = w_k.sum() + 1e-8
+        #     fairness_scores[f"subgroup_{k}_bias"] = (numer / denom).item()
 
-    #     # combine results
-    #     result = {
-    #         "accuracy": acc,
-    #         "precision": p,
-    #         "recall": r,
-    #         "f1": f1,
-    #         "FPR_overall": fpr,
-    #     }
-    #     result.update(fairness_scores)
-    #     return result
+        # combine results
+        result = {
+            "accuracy": acc,
+            "precision": p,
+            "recall": r,
+            "f1": f1,
+            "FPR_overall": fpr,
+        }
+        result.update(fairness_scores)
+        return result
 
 
 
-    def train(self, ds):
+    def train(self, ds, save_path):
 
         train_dataset, valid_dataset = self.prepare_dataset(ds, batch_size=8)
         print("====== DATASET PREPARED ========")
@@ -372,7 +398,7 @@ class FairToxic:
             per_device_eval_batch_size=16,
             learning_rate=2e-5,
             gradient_accumulation_steps=4,
-            num_train_epochs=3,
+            num_train_epochs=2,  # 3
             fp16=True,
             # dataloader_num_workers=2,
             gradient_checkpointing=True,
@@ -411,8 +437,10 @@ class FairToxic:
             train_dataset=train_dataset,
             eval_dataset=valid_dataset,
             data_collator= data_collator,
+            compute_metrics = None,
             # callbacks=[ToxicDirectionCallback()]
-            callbacks = [callback]
+            callbacks = [callback],
+            warmup_epochs= 1
         )
 
         callback.trainer = trainer
@@ -420,28 +448,37 @@ class FairToxic:
         trainer.lambda_orth = 0.3 
         trainer.v_tox = torch.zeros(self.hidden_size)
 
+        # trainer.full_loader = full_loader
 
         trainer.train()
 
 
-        save_path= save_path + "/best"
+        # save
+
+        save_path = save_path + "/best"
         
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
         print(f"Model saved locally at: {save_path}")
 
-        repo_name = "eunie922/" + save_path
-        create_repo(repo_name)
 
-        if repo_name is None:
-            raise ValueError("`repo_name` must be provided for HuggingFace Hub upload.")
+        logs = trainer.state.log_history
+        print(logs)
 
-        print(f"Pushing model to HuggingFace Hub repo: {repo_name} ...")
+        losses = [x["loss_fair"] for x in logs if "loss_fair" in x]
+        plt.plot(losses)
 
-        self.model.push_to_hub(repo_name)
-        self.tokenizer.push_to_hub(repo_name)
+        losses = [x["loss_ce"] for x in logs if "loss_ce" in x]
+        plt.plot(losses)
 
-        print(f"Successfully uploaded to https://huggingface.co/{repo_name}")
+        losses = [x["loss_subgroup"] for x in logs if "loss_subgroup" in x]
+        plt.plot(losses)
+
+        losses = [x["loss_toxic"] for x in logs if "loss_toxic" in x]
+        plt.plot(losses)
+
+        plt.savefig("loss_curve.png")
+        plt.show()
 
         
         print("=== Final Evaluation ===")
@@ -458,13 +495,11 @@ if __name__ == "__main__":
     
     # df = pd.read_csv(r"datasets/JIGSAW/train.csv")
     # print(df.head())
-
-    df = load_from_disk("preprocessed_train")
-
-    race_ds = toxic_preprocess(df, "race")
-    trainer = FairToxic("bert-base-uncased", race_ds)
-    trainer.train(race_ds)
-
-
+    
+    df = load_from_disk("datasets/preprocessed_all")
+    relig_ds = toxic_preprocess(df, "religion", False)
+    # torch.sum(race_ds["weights"])
+    trainer = FairToxic("bert-base-uncased", relig_ds)
+    trainer.train(relig_ds, "fair_path/relig_001")
 
 
