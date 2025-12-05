@@ -1,6 +1,12 @@
 # nlp_2025
 SNU 2025 Fall / Introduction to NLP / Project codes
 
+
+### Dataset
+
+https://www.kaggle.com/competitions/jigsaw-unintended-bias-in-toxicity-classification/overview
+
+
 Here's the pipeline of overall evaluation. \
 (check the fair.tools.py for details) 
 
