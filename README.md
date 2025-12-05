@@ -53,3 +53,22 @@ For embedding analysis, use ```id_emb_dist``` function.
 relig_dist = id_emb_dist(relig_baseline, "religion", model_ckpt, True)
 print(relig_dist)
 ```
+
+
+---
+
+## **2. FAIR Train evaluation**
+
+```
+# df = load_from_disk("datasets/preprocessed_all")
+relig_ds, no_id_ds = toxic_preprocess(df, "religion", False)
+eval_ds = relig_ds.train_test_split(test_size=0.2, seed=2025)
+eval_ds = concatenate_datasets([eval_ds["test"], no_id_ds])
+
+model_ckpt = "fair_path/relig_001/best"
+eval_pred = get_pred(eval_ds, model_ckpt, False)
+relig_res, relig_metric = subgroup_eval(eval_pred, "religion", True, True)
+```
+
+
+
