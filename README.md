@@ -1,5 +1,9 @@
-# nlp_2025
+# Unintended Bias in Toxicity Classification 
+### : analyzing and mitigating representational bias in toxicity models
+
 SNU 2025 Fall / Introduction to NLP / Project codes
+
+
 
 
 ### Dataset
